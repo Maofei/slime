@@ -155,9 +155,12 @@ def args_to_server_args(args):
 
 `skipped_args`（`tp_size`、`port`、`nnodes`、`nccl_port` 等）是 slime
 明确接管的字段。这些参数不让用户传，由 slime 根据 `--rollout-num-gpus-per-engine`、
-`--actor-num-nodes` 等高层配置算出来。这条"slime 接管，不透传"的
-白名单是这一层抽象的边界——能让用户传的全透传，slime 自己算的
-不透传。
+`--actor-num-nodes` 等高层配置算出来。这几个的共同点是它们的值都
+**依赖 slime 自己的并行拓扑或 Ray 分配**——`tp_size` 由
+`--rollout-num-gpus-per-engine` 推出来，`port` / `nccl_port` 由
+Ray 决定；让用户传反而会和 slime 的 placement 冲突。这条"slime
+接管，不透传"的白名单是这一层抽象的边界——**能让用户传的全透传，
+slime 自己算的不透传**。
 
 ## 2.3 Megatron 透传：寄生策略
 
@@ -165,7 +168,11 @@ Megatron 不能用 SGLang 那套技巧。原因是 Megatron 的 `parse_args` 是
 个**顶层入口函数**，它自己创建 parser、自己注册参数、自己调
 `parser.parse_args()`，slime 没机会在中间塞 wrapper。
 
-slime 的应对是"寄生"：让自己的参数注册作为 Megatron 的
+slime 把自己的 ~150 个参数寄生到 Megatron parser 里靠**三招**：
+`extra_args_provider` 注入参数、`reset_arg` 改默认值、
+`ignore_unknown_args=True` 容忍 `--sglang-*`。下面依次看。
+
+**第一招**：让 slime 的参数注册作为 Megatron 的
 `extra_args_provider`，钻进 Megatron 的 parser 里：
 
 ```python
@@ -185,21 +192,23 @@ args = megatron_parse_args(
 `--tensor-model-parallel-size` 和 `--rollout-batch-size` 看起来是同
 一套体系。
 
-但 slime 经常想要的不是"加新参数"，而是**改 Megatron 已有参数的默认值**——
+**第二招**：slime 经常想要的不是"加新参数"，而是**改 Megatron 已有
+参数的默认值**——
 比如 slime 默认希望 `--seed` 是某个值、`--clip-grad` 是 1.0、
 `--micro-batch-size` 不再是 Megatron 那个不合理的默认。直接 `add_argument`
 会冲突报错；slime 用一个叫 `reset_arg` 的小工具原地改默认值
 （`slime/utils/arguments.py:20-33`）：
 
 ```python
-def reset_arg(parser, name, **kwargs):
-    for action in parser._actions:
-        if name in action.option_strings:
-            if "default" in kwargs:
-                action.default = kwargs["default"]
-            break
-    else:
-        parser.add_argument(name, **kwargs)  # 没找到才新增
+# 伪代码 —— illustrative, 完整源码见 slime/utils/arguments.py
+def override_default(parser, flag, new_default):
+    # 原地遍历 argparse 的私有 _actions 列表
+    for existing in parser._actions:
+        if flag in existing.option_strings:
+            existing.default = new_default
+            return
+    # 找不到就当成新参数注册
+    parser.add_argument(flag, default=new_default)
 ```
 
 这个函数在 `arguments.py` 里被调用了 14 次左右，专门用来把 Megatron
@@ -207,13 +216,12 @@ def reset_arg(parser, name, **kwargs):
 `_actions` 私有 API——这是 Python 标准库里不保证稳定的接口，但
 argparse 本身十年没动过这块结构，所以这种 hack 在实践中很稳。
 
-第三个钉子是 Megatron parser 的 `ignore_unknown_args=True`——这让
+**第三招**是 Megatron parser 的 `ignore_unknown_args=True`——这让
 Megatron 在解析时遇到 `--sglang-mem-fraction-static 0.7` 这种自己
 不认识的参数时**不报错**，留给已经在 Phase 1 解析完的 sglang_ns 兜底。
 没有这一条，Phase 2 的 Megatron parser 看到 `--sglang-*` 会直接 panic。
 
-把这三招（`extra_args_provider`、`reset_arg`、`ignore_unknown_args=True`）
-合起来看，slime 在 Megatron 升级时几乎不用改自己的参数代码——Megatron
+三招合起来看，slime 在 Megatron 升级时几乎不用改自己的参数代码——Megatron
 新加参数，slime 不感知（除非那个参数有 slime 关心的默认值需要 reset）；
 Megatron 重命名参数，slime 的 `reset_arg` 会因为找不到旧名字而触发
 `else` 分支去新增——这个时候你才需要回来更新 slime 代码。
@@ -438,6 +446,8 @@ slime 没有 `train_sft.py` / `train_rl.py` / `train_ppo.py`。这些
 
 参数解析完之后，`train.py` 的下一行就是 `pgs = create_placement_groups(args)`。
 这一行触发的是 slime 把 args 翻译成 Ray placement bundles + 启动
-Megatron 与 SGLang 引擎的整套启动序列。下一章打开 `slime/ray/` 和
-`slime/backends/`，看 slime 是怎么把 args 里的几十个参数变成数百个
-进程在数十张 GPU 上各就各位的。
+Megatron 与 SGLang 引擎的整套启动序列。下一章会看到 colocate 部署
+下 actor 和 rollout 怎么共享同一组 GPU 而不打架——答案是
+`_get_placement_group_layout` 里 **`offset = 0`** 这一行。整章会
+打开 `slime/ray/` 和 `slime/backends/`，看 slime 怎么把 args 里
+的几十个参数变成数百个进程在数十张 GPU 上各就各位。

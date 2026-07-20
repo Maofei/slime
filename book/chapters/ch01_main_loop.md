@@ -77,7 +77,7 @@ Ray actor，`generate` 是它的方法，`.remote(rollout_id)` 返回的是
 所有形态——同步、流式、long-tail 异步、SFT、on-policy distillation、
 sleep——都被压到了同一个 `generate.remote()` 调用之后；选哪种形态
 靠的是配置层（`--rollout-function-path` 这个 customization hook，
-第 10 章）和 rollout manager 内部状态机（第 5 章），不需要主循环
+第 10 章）和 `RolloutManager` 内部状态机（第 5 章），不需要主循环
 知道。
 
 **`update_weights()` 出现两次**。一次在 for 之前（阶段 4），一次
@@ -103,7 +103,7 @@ gantt
 
     section 启动序列
     阶段 1 placement 分配          :a1, 0, 1
-    阶段 2 rollout manager 初始化  :a2, after a1, 2
+    阶段 2 RolloutManager 初始化   :a2, after a1, 2
     阶段 3 training models 初始化  :a3, after a2, 2
     阶段 4 第一次 weight push      :a4, after a3, 1
 
@@ -151,8 +151,11 @@ sequenceDiagram
 
 - **Driver**：`train.py` 主循环本身
 - **Rollout**：`RolloutManager`——CPU sidecar，0 GPU
-- **Engine**：`SGLang Engine`——持有 GPU 的 Ray actor
-- **Hook**：用户配置的 `custom_generate` 函数（如果有）
+- **Engine**：`SGLang Engine`——持有 GPU 资源的 Ray actor（actor 本身
+  是 HTTP 客户端，实际模型在它 fork 出的子进程里，详见第 3 章）
+- **Hook**：用户配置的 `custom_generate` 函数（如果有）——hook 是
+  用户提供的 Python 函数路径（由 `--xxx-path` 参数指定），是 slime
+  暴露扩展点的统一形式，详见第 10 章
 - **Train**：`TrainActor`——Megatron 训练侧
 
 这张图把整本书的结构摊开了。每一段调用对应至少一个章节：
@@ -210,7 +213,8 @@ sequenceDiagram
 读这张表的方式不是从上到下背下来，而是带着一个问题翻：**主循环为
 什么有底气把这些都推走？**
 
-答案是 slime 在赌五件事，每一件都被这本书的某一群章节验证：
+答案是 slime 在赌五件事——每一件后面都有一组章节展开具体技术。
+这里只点题，不展开（每条赌注的第一次正式论证留给对应章节做）：
 
 **赌注 1：一条数据路径**。所有看起来像"独立子系统"的东西
 （trainer、rollout service、agent framework）都被收束进同一条
@@ -248,7 +252,8 @@ megatron.core.mpu stub` 做出来了。**第 11、12 章**讲这套基础设施
 读到这里你应该有这种感觉：100 行的主循环不是"够用"的产物，是
 "刻意"的产物。每多一行都意味着主循环承担了本该属于子系统的协调
 工作。slime 的设计哲学是把协调推给子系统接口的契约，让主循环只做
-"按顺序调用"。
+"按顺序调用"——这五条赌注就是它把哪些复杂度推到了哪些子系统的
+具体落点。
 
 ## 1.4 train.py vs train_async.py
 

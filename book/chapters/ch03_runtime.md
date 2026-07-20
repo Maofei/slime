@@ -243,7 +243,8 @@ if args.offload_rollout:
 
 这几件事都不在主循环里——它们是 "for-loop 开始之前必须就位的状态"。
 slime 把这种**一次性的协调动作**放在 placement 与训练 actor 创建
-之间的窗口里执行，是它能让主循环保持 100 行的关键之一。
+之间的窗口里执行，是它能让主循环保持 100 行的关键之一——主循环
+不需要 `if is_first_step:` 来跑只在第一次迭代有用的代码。
 
 ## 3.4 引擎初始化：各自的进程模型
 
@@ -313,10 +314,52 @@ care SGLang 内部怎么 fork、怎么调度、怎么 cache。weight sync 等
 store——这意味着 slime 升级 Ray 时不影响 weight sync。
 
 两个引擎都按自己的方式独立运行；它们之间的硬耦合点只有**一个**：
-`slime/backends/megatron_utils/sglang.py`，整个文件 **44 行**——把
+`slime/backends/megatron_utils/sglang.py`，整个文件 **43 行**——把
 Megatron 侧用到的所有 SGLang 符号集中 import + 版本兼容兜异常。
 这是 slime 给自己设的边界——任何想从 Megatron 侧调 SGLang 的代码
-都必须从这 44 行过，避免硬耦合在仓库里到处蔓延。
+都必须从这 43 行过，避免硬耦合在仓库里到处蔓延。
+
+把 §3.1-§3.4 讲到的所有角色摆在一张图上，slime 启动完成后的进程
+拓扑长这样（图例：圆角矩形 = Ray actor，灰底 = 0 GPU、黄底 = 占
+fractional GPU、蓝底 = 持有 GPU + fork 子进程）：
+
+```mermaid
+graph TB
+    Driver(["Driver<br/>train.py 主循环<br/>0 GPU"])
+    RM(["RolloutManager<br/>1485 行 sidecar<br/>0 GPU"])
+    Lock(["Lock actor<br/>colocate 互斥<br/>0 GPU"])
+    Train1(["TrainActor #1<br/>Megatron<br/>num_gpus=0.4"])
+    TrainN(["TrainActor #N<br/>Megatron<br/>num_gpus=0.4"])
+    Eng1(["SGLangEngine #1<br/>Ray actor 是 HTTP 客户端<br/>num_gpus=0.4"])
+    EngM(["SGLangEngine #M<br/>Ray actor 是 HTTP 客户端<br/>num_gpus=0.4"])
+    Sub1["multiprocessing fork 子进程<br/>SGLang 实际推理<br/>占满 GPU 算力"]
+    SubM["multiprocessing fork 子进程<br/>SGLang 实际推理<br/>占满 GPU 算力"]
+
+    Driver -->|async_train.remote| Train1
+    Driver -->|async_train.remote| TrainN
+    Driver -->|generate.remote| RM
+    RM -->|HTTP /generate| Eng1
+    RM -->|HTTP /generate| EngM
+    RM -.acquire.-> Lock
+    Train1 -.acquire.-> Lock
+    Eng1 ==>|fork| Sub1
+    EngM ==>|fork| SubM
+
+    style Driver fill:#f5f5f5
+    style RM fill:#f5f5f5
+    style Lock fill:#f5f5f5
+    style Train1 fill:#fff3cd
+    style TrainN fill:#fff3cd
+    style Eng1 fill:#cce5ff
+    style EngM fill:#cce5ff
+    style Sub1 fill:#cce5ff
+    style SubM fill:#cce5ff
+```
+
+这张图把 §3.1-§3.4 的概念全部具象化：CPU sidecar（灰）只协调不
+算力、TrainActor（黄）和 SGLangEngine（蓝）共享 GPU 靠 fractional
+声明 + Lock actor 互斥、SGLangEngine 自己不跑模型而是 fork 子进程
+跑。读者合上书后回想 slime 的进程拓扑，记得的就是这张图。
 
 ## 3.5 两套 model bridge 的并存
 
@@ -455,7 +498,7 @@ slime 同时有 `mbridge`（9 模型，稳定）和 `megatron_bridge`（1 模型
 
 ## 下一站
 
-到这里 placement 就绪、train actor 就绪、rollout manager 就绪、
+到这里 placement 就绪、train actor 就绪、`RolloutManager` 就绪、
 SGLang engine 就绪。`train.py` 进入它的主循环。下两章我们分别打开
 两个核心循环——第 4 章看 Megatron 这一侧的训练 step 怎么走，第 5
-章看 SGLang 这一侧的 rollout manager 在 1485 行里到底做了什么。
+章看 SGLang 这一侧的 `RolloutManager` 在 1485 行里到底做了什么。

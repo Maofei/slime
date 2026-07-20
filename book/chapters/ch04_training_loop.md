@@ -13,13 +13,13 @@ actor_model.async_train(rollout_id, rollout_data_ref)
 完整训练 step：rollout data → micro-batch 切分 → forward → loss →
 backward → optimizer step。
 
-这一章和下一章并列是全书最重要的两章。它们解释 slime "一条数据
-路径" 赌注在两侧分别怎么落地。Megatron 这一侧的故事——也是本章
-的核心论点——可以一句话总结：**slime 几乎不重写 Megatron 的训练
-step**。它的工作集中在四个夹缝里：loss 函数、micro-batch 调度、
-ref/teacher/old_actor 切换、checkpoint 输出。但这四个夹缝里藏着
-分布式 RL 训练里最容易被忽略也最容易出问题的细节——尤其是 loss
-那条线上的 **4 处梯度放缩**。
+训练 step 是 RL 框架里最容易"看似 supervised"但其实暗藏分布式
+数值陷阱的地方。Megatron 这一侧的故事——也是本章的核心论点——
+可以一句话总结：**slime 几乎不重写 Megatron 的训练 step**。它的
+工作集中在四个夹缝里：loss 函数、micro-batch 调度、ref/teacher/
+old_actor 切换、checkpoint 输出。但这四个夹缝里藏着分布式 RL 训练
+里最容易被忽略也最容易出问题的细节——尤其是 loss 那条线上的
+**4 处梯度放缩**。
 
 这一章会花最大的篇幅讲那 4 处放缩。它是 slime 整个 training 子系统
 里最"反直觉但必须正面讲清"的设计；如果你以后要做自己的 RL 框架，
@@ -91,15 +91,28 @@ else:
 再除以 `step_global_batch_size` 再乘以 `dp × cp`？这看起来像随手凑
 出来的"缩放因子"。
 
-它不是随手凑的。它是一个**反向消除链路**的一个环节——slime 想要
-最终的梯度等于"每个 rollout 算一个 mean，所有 rollout 的 mean 加
-起来除以总数"，也就是 **per-rollout-mean** 梯度。但实际计算这个
-梯度时，loss 要穿过 Megatron 的 pipeline schedule、Megatron 的 DDP
-grad reduce，这两层都会自动做一些数值放缩。slime 必须在自己的 loss
-里**反向消除这些下游的放缩**，让它们抵消之后剩下的恰好是
-per-rollout-mean。
+要理解它必须**反向追溯**：先看下游（Megatron schedule、Megatron
+DDP）默认会对 loss 做什么放缩，再回头看 slime 这两行在抵消什么。
 
-把整条链路画出来看更清楚：
+**下游放缩 1（Megatron schedule）**：Megatron 的 pipeline schedule
+在每个 micro-batch 跑完 forward 后，会自动把 loss `÷ num_microbatches`
+——它假设 "loss 的总贡献是各 mb 的均值"。这个除法是 Megatron 给
+传统训练设计的，没法关掉。
+
+**下游放缩 2（Megatron DDP）**：grad reduce 阶段，Megatron DDP 在
+`dp × cp` 组里做平均 `× 1 / (dp × cp)`——同样是默认行为。
+
+slime 想要的最终梯度是 **per-rollout-mean**：每个 rollout 算一个
+mean，所有 rollout 的 mean 加起来除以总数。如果 slime 不做任何
+处理，loss 经过上面两步默认放缩后，得到的梯度会被多除一个
+`num_microbatches × dp × cp` ——数值上完全不对。
+
+所以 slime 必须在自己的 `loss_function` 里**预先反向乘上这些**：
+`× num_microbatches × dp × cp`。再加上 slime 自己想要除 `step_global_batch_size`
+（把 "sum" 变成 "mean per global batch"），就凑出了那两行
+神秘代码 `× num_microbatches / step_global_batch_size × (dp × cp)`。
+
+整条链路连起来看：
 
 ```mermaid
 graph LR
@@ -112,6 +125,29 @@ graph LR
     B --> C
     C --> D
     D --> E
+```
+
+如果换成"谁的责任"的视角看，4 处放缩分别由谁触发更清楚——只有
+第 2 步是 slime 主动写在 `loss_function` 里的代码，其余 3 步都是
+框架默认行为：
+
+```mermaid
+sequenceDiagram
+    participant Slime as slime loss_function
+    participant Mega as Megatron schedule
+    participant DDP as Megatron DDP
+    participant Grad as 最终 grad
+    Slime->>Slime: 算 per-mb 的 sum_of_sample_mean
+    Note over Slime: 第 1 步：slime 主动算
+    Slime->>Slime: 乘 num_mbs × dp × cp / step_gbs
+    Note over Slime: 第 2 步：slime 主动 pre-scale (那两行神秘代码)
+    Slime->>Mega: 把 loss 交给 schedule
+    Mega->>Mega: 除以 num_microbatches
+    Note over Mega: 第 3 步：Megatron 框架默认行为
+    Mega->>DDP: 把 grad 交给 DDP reduce
+    DDP->>DDP: 在 dp×cp 组里平均
+    Note over DDP: 第 4 步：Megatron DDP 默认行为
+    DDP->>Grad: 第 2 步 × 第 3 步 × 第 4 步 = 1 / step_gbs
 ```
 
 把 4 步的放缩因子乘起来：
